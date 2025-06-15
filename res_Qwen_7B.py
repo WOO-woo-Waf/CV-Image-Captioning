@@ -9,14 +9,7 @@ from PIL import Image
 import pandas as pd
 from io import BytesIO
 from torch.amp import autocast, GradScaler
-
-# 这里直接用CLIP的预处理
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                         std=[0.26862954, 0.26130258, 0.27577711])
-])
+from torchvision.models import resnet101, ResNet101_Weights
 
 class COCO(Dataset):
     def __init__(self, dataframe, transform=None):
@@ -50,14 +43,37 @@ class COCO(Dataset):
 class VisualEncoder(nn.Module):
     def __init__(self, freeze=True):
         super().__init__()
-        self.clip = CLIPVisionModel.from_pretrained('./Clip')
+        resnet = resnet101(ResNet101_Weights.IMAGENET1K_V2)
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
         if freeze:
-            for p in self.clip.parameters():
+            for p in self.features.parameters():
                 p.requires_grad = False
-
+        
+        self.spatial_reduce = nn.Sequential(
+            nn.Conv2d(2048, 1024, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)) 
+        )
+        
+        self.proj = nn.Sequential(
+            nn.Linear(1024, 1536),
+            nn.GELU(),
+            nn.LayerNorm(1536),
+            nn.Linear(1536, 768),
+            nn.GELU(),
+            nn.LayerNorm(768)
+        )
+        
+        self.position_emb = nn.Parameter(torch.randn(1, 16, 768) * 0.02) # 这里加上一个位置编码，不过可以考虑不要
+    
     def forward(self, x):
-        outputs = self.clip(pixel_values=x)
-        return outputs.last_hidden_state
+        x = self.features(x)  # (B, 2048, 7, 7)
+        x = self.spatial_reduce(x)  # (B, 1024, 4, 4)
+        B, C, H, W = x.shape
+        x = x.view(B, C, -1).permute(0, 2, 1)  # (B, 16, 1024)
+        x = self.proj(x)  # (B, 16, 768)
+        return x + self.position_emb  
+
 
 class BLIPQFormer(nn.Module):
     def __init__(self, num_queries=32, d_model=768, nhead=8, num_layers=6):
@@ -129,6 +145,7 @@ class VisionLanguageModel(nn.Module):
         super().__init__()
         self.visual_encoder = VisualEncoder()
         self.language_model = AutoModelForCausalLM.from_pretrained(lm_path)
+        self.language_model.gradient_checkpointing_enable()
         if freeze:
             for p in self.language_model.parameters():
                 p.requires_grad = False
@@ -190,10 +207,10 @@ def train_ddp(rank, world_size):
                 df = pd.read_parquet(os.path.join(root, file))
                 all_data.append(df)
     combined_data = pd.concat(all_data, ignore_index=True)
-
+    transform = ResNet101_Weights.IMAGENET1K_V2.transforms()
     dataset = COCO(combined_data, transform)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=2, sampler=sampler, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=8, sampler=sampler, num_workers=4)
 
     lm_path = './model'
     model = VisionLanguageModel(lm_path, freeze=True).to(rank)
@@ -202,10 +219,22 @@ def train_ddp(rank, world_size):
     
     optimizer = torch.optim.Adam([
         {'params': model.module.qformer.parameters()},
-        {'params': model.module.proj.parameters()}
+        {'params': model.module.proj.parameters()},
+        {'params': model.module.visual_encoder.proj.parameters()},
+        {'params': model.module.visual_encoder.spatial_reduce.parameters()},
+        {'params': [model.module.visual_encoder.position_emb]}
     ], lr=1e-4, weight_decay=1e-5)
 
-    num_epochs = 10
+    # 因为只能跑两天，所以一个epoch，一个epoch的来跑
+    checkpoint_path = 'clip_qformer.pth'
+    if rank == 0 and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if rank == 0:
+            print(f"恢复训练")
+
+    num_epochs = 3
     scaler = GradScaler()
     prompt_text = "Describe the image:"
     for epoch in range(num_epochs):
@@ -217,9 +246,9 @@ def train_ddp(rank, world_size):
             images = images.to(rank)
             prompt_batch = [prompt_text] * images.size(0)  # 现在是没加提示词，其实也可以把提示词加上去
             p = tokenizer(prompt_batch, return_tensors='pt', padding='max_length',
-                          truncation=True, max_length=100).to(rank)
+                          truncation=True, max_length=60).to(rank)
             c = tokenizer(captions, return_tensors='pt', padding='max_length',
-                          truncation=True, max_length=100).to(rank)
+                          truncation=True, max_length=60).to(rank)
 
             optimizer.zero_grad()
             with autocast(device_type='cuda'):  
@@ -247,7 +276,11 @@ def train_ddp(rank, world_size):
             print(f"Epoch {epoch+1} 完成，平均 Loss: {avg_loss:.4f}")
 
     if rank == 0:
-        torch.save(model.module.state_dict(), 'clip_qformer.pth')
+        # torch.save(model.module.state_dict(), 'clip_qformer.pth')
+        torch.save({
+            'model_state_dict': model.module.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        }, checkpoint_path)
 
 if __name__ == "__main__":
     rank, world_size = setup_distributed()
