@@ -54,29 +54,17 @@ class VisualEncoder(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((4, 4)) 
         )
-        
-        self.proj = nn.Sequential(
-            nn.Linear(1024, 1536),
-            nn.GELU(),
-            nn.LayerNorm(1536),
-            nn.Linear(1536, 768),
-            nn.GELU(),
-            nn.LayerNorm(768)
-        )
-        
-        self.position_emb = nn.Parameter(torch.randn(1, 16, 768) * 0.02) # 这里加上一个位置编码，不过可以考虑不要
     
     def forward(self, x):
         x = self.features(x)  # (B, 2048, 7, 7)
         x = self.spatial_reduce(x)  # (B, 1024, 4, 4)
         B, C, H, W = x.shape
         x = x.view(B, C, -1).permute(0, 2, 1)  # (B, 16, 1024)
-        x = self.proj(x)  # (B, 16, 768)
-        return x + self.position_emb  
+        return x
 
 
 class BLIPQFormer(nn.Module):
-    def __init__(self, num_queries=32, d_model=768, nhead=8, num_layers=6):
+    def __init__(self, num_queries=32, d_model=1024, nhead=8, num_layers=6):
         super().__init__()
         self.num_queries = num_queries
         self.query_embed = nn.Parameter(torch.randn(1, num_queries, d_model))
@@ -153,9 +141,9 @@ class VisionLanguageModel(nn.Module):
         self.token_embedding = self.language_model.get_input_embeddings()
         self.embed_dim = self.token_embedding.embedding_dim
         
-        self.qformer = BLIPQFormer(d_model=768)
+        self.qformer = BLIPQFormer(d_model=1024)
         
-        self.proj = PrefixTransformer(input_dim=768, embed_dim=self.embed_dim)
+        self.proj = PrefixTransformer(input_dim=1024, embed_dim=self.embed_dim)
 
     def forward(self, images, prompt_ids, prompt_mask, cap_ids, cap_mask):
         B = images.size(0)
@@ -210,7 +198,7 @@ def train_ddp(rank, world_size):
     transform = ResNet101_Weights.IMAGENET1K_V2.transforms()
     dataset = COCO(combined_data, transform)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(dataset, batch_size=8, sampler=sampler, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=4)
 
     lm_path = './model'
     model = VisionLanguageModel(lm_path, freeze=True).to(rank)
@@ -220,21 +208,17 @@ def train_ddp(rank, world_size):
     optimizer = torch.optim.Adam([
         {'params': model.module.qformer.parameters()},
         {'params': model.module.proj.parameters()},
-        {'params': model.module.visual_encoder.proj.parameters()},
         {'params': model.module.visual_encoder.spatial_reduce.parameters()},
-        {'params': [model.module.visual_encoder.position_emb]}
     ], lr=1e-4, weight_decay=1e-5)
 
-    # 因为只能跑两天，所以一个epoch，一个epoch的来跑
     checkpoint_path = 'clip_qformer.pth'
-    if rank == 0 and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if rank == 0:
-            print(f"恢复训练")
+    # if rank == 0 and os.path.exists(checkpoint_path):
+    #     checkpoint = torch.load(checkpoint_path)
+    #     model.module.load_state_dict(checkpoint['model_state_dict'])
+    #     if rank == 0:
+    #         print(f"恢复训练")
 
-    num_epochs = 3
+    num_epochs = 1
     scaler = GradScaler()
     prompt_text = "Describe the image:"
     for epoch in range(num_epochs):
@@ -276,13 +260,27 @@ def train_ddp(rank, world_size):
             print(f"Epoch {epoch+1} 完成，平均 Loss: {avg_loss:.4f}")
 
     if rank == 0:
-        # torch.save(model.module.state_dict(), 'clip_qformer.pth')
-        torch.save({
-            'model_state_dict': model.module.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict()
-        }, checkpoint_path)
+        torch.save(model.module.state_dict(), checkpoint_path)
+
+def extract_and_save_parameters(model_path, save_path):
+    # 加载已保存的模型
+    checkpoint = torch.load(model_path)
+    model = VisionLanguageModel(lm_path='./model', freeze=True)
+    model.load_state_dict(checkpoint)
+
+    # 提取并保存 VisualEncoder、QFormer 和 proj 的参数
+    extracted_params = {
+        'visual_encoder': model.visual_encoder.state_dict(),
+        'qformer': model.qformer.state_dict(),
+        'proj': model.proj.state_dict()
+    }
+
+    # 保存提取的参数
+    torch.save(extracted_params, save_path)
+    print(f"提取的参数已保存到: {save_path}")
 
 if __name__ == "__main__":
-    rank, world_size = setup_distributed()
-    train_ddp(rank, world_size)
-    cleanup_distributed()
+    # rank, world_size = setup_distributed()
+    # train_ddp(rank, world_size)
+    # cleanup_distributed()
+    extract_and_save_parameters(model_path='./clip_qformer.pth', save_path='./res_qformer_small.pth')
